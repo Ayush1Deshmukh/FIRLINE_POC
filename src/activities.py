@@ -2,13 +2,13 @@ import os
 import json
 import google.generativeai as genai
 from dotenv import load_dotenv
+from temporalio import activity  # <-- 1. IMPORT TEMPORAL'S ACTIVITY DECORATOR
 
 # Import our local tools
 from src.tools import search_logs
 from src.notifications import post_to_slack
 
 # --- 1. SETUP ---
-# Load environment variables from .env file
 load_dotenv()
 
 # --- NEW: Setup Google GenAI Client ---
@@ -18,11 +18,10 @@ try:
         raise ValueError("GOOGLE_API_KEY not found. Did you set it in the .env file?")
     genai.configure(api_key=GOOGLE_API_KEY)
 except Exception as e:
-    print(f"Error initializing Google GenAI client: {e}")
-    # In a real app, we'd use logging, not print
+    activity.logger.error(f"Error initializing Google GenAI client: {e}")
+    # We'll let the activity fail if the client can't be set up.
 
 # --- 2. DEFINE THE "TOOLS" FOR THE LLM ---
-# This is the JSON Schema for our function, which Google's API understands.
 search_logs_tool = {
     "name": "search_logs",
     "description": "Searches a log file for ERROR lines within a time window around a specific timestamp.",
@@ -31,7 +30,7 @@ search_logs_tool = {
         "properties": {
             "timestamp_str": {
                 "type": "STRING",
-                "description": "The ISO 8601 timestamp string for the center of the search window (e.g., '2025-10-21T03:05:00Z')."
+                "description": "The ISO 8601 timestamp string (e.g., '2025-10-21T03:05:00Z')."
             },
             "log_file": {
                 "type": "STRING",
@@ -45,6 +44,7 @@ search_logs_tool = {
         "required": ["timestamp_str", "log_file"]
     }
 }
+
 # --- 3. DEFINE THE AGENT'S "PERSONALITY" AND TASK ---
 SYSTEM_PROMPT = """
 You are "Fireline-01", an autonomous SRE incident investigation agent.
@@ -61,86 +61,87 @@ Follow these steps:
 """
 
 # --- 4. CREATE THE MODEL ---
-# We configure the model with the system prompt and tools
-# We'll use Gemini 1.5 Pro, as it's great at function calling
+# This is fine to define globally. The model client is thread-safe.
 model = genai.GenerativeModel(
     model_name='gemini-pro',
     system_instruction=SYSTEM_PROMPT,
-    tools=[search_logs_tool]  # Pass the tool definition here
+    tools=[search_logs_tool]
 )
 
 
-# --- 5. THE MAIN ORCHESTRATION FUNCTION (REFACTORED) ---
-def handle_incident(alert: dict):
+# --- 5. THE ACTIVITY DEFINITION ---
+@activity.defn  # <-- 2. ADD THE DECORATOR
+async def run_investigation(alert: dict) -> str:  # <-- 3. MAKE IT 'async'
     """
-    This is the main investigation logic, now using Google Gemini.
+    This is the main investigation Activity, using Google Gemini.
     """
-    print("--- 🔥 Fireline Investigation Started ---")
-    print(f"--- 📥 Received Alert: {alert['error_message']} for {alert['service']} ---")
+    # 4. USE THE ACTIVITY LOGGER, NOT print()
+    activity.logger.info(f"--- 🔥 Fireline Investigation Started for {alert['service']} ---")
 
     # --- Create a new chat session for this incident ---
     chat = model.start_chat()
 
     # --- First LLM Call: Get the tool to use ---
-    print("--- 🧠 Agent: Analyzing alert and selecting tool... ---")
+    activity.logger.info("--- 🧠 Agent: Analyzing alert and selecting tool... ---")
     
-    # Send the first message
     user_prompt = f"New Incident Alert: {json.dumps(alert)}"
-    response = chat.send_message(user_prompt)
+    
+    # 5. USE THE ASYNC 'await' SYNTAX
+    response = await chat.send_message_async(user_prompt)
     
     response_message = response.candidates[0].content
     
     # --- 2. Check if the LLM wants to use a tool ---
     if not response_message.parts[0].function_call:
-        print("--- 🧠 Agent: Did not select a tool. Providing analysis instead: ---")
+        activity.logger.warn("--- 🧠 Agent: Did not select a tool. Providing analysis instead: ---")
         final_summary = response_message.parts[0].text
-        print(final_summary)
+        activity.logger.info(final_summary)
         if final_summary:
             post_to_slack(final_summary)
-        return
+        return final_summary  # <-- 6. RETURN A VALUE
 
     # The model wants to call our tool.
     function_call = response_message.parts[0].function_call
     function_name = function_call.name
 
     if function_name == "search_logs":
-        print(f"--- 🧠 Agent: Decided to call `{function_name}` tool. ---")
+        activity.logger.info(f"--- 🧠 Agent: Decided to call `{function_name}` tool. ---")
 
-        # Get the arguments from the function call
         function_args = function_call.args
 
-        # 3. Call the *actual* Python function
+        # 3. Call the *actual* Python function (this is sync, which is fine)
         tool_output = search_logs(
             timestamp_str=function_args.get("timestamp_str"),
             log_file=function_args.get("log_file", "mock_service.log"),
             time_window_seconds=function_args.get("time_window_seconds", 60)
         )
         
-        # Convert the list output to a JSON string for the model
         tool_output_json = json.dumps(tool_output)
 
-        print("--- 🧠 Agent: Sending tool output back to LLM for final analysis... ---")
+        activity.logger.info("--- 🧠 Agent: Sending tool output back to LLM for final analysis... ---")
 
-        # 4. Send the tool's results back to the LLM
-        # The 'chat' object remembers the history
-        final_response = chat.send_message(
+        # 4. Send the tool's results back to the LLM (using async)
+        final_response = await chat.send_message_async(
             [
                 genai.types.Part(
                     function_response=genai.types.FunctionResponse(
                         name="search_logs",
-                        response={"result": tool_output_json} # Send tool output as a dict
+                        response={"result": tool_output_json}
                     )
                 )
             ]
         )
 
         final_summary = final_response.candidates[0].content.parts[0].text
-        print("--- ✅ Investigation Complete. Final Summary: ---")
-        print(final_summary)
+        activity.logger.info("--- ✅ Investigation Complete. Final Summary: ---")
+        activity.logger.info(final_summary)
 
         # --- 5. POST THE FINAL SUMMARY TO SLACK ---
         if final_summary:
             post_to_slack(final_summary)
 
+        return final_summary  # <-- 6. RETURN THE FINAL RESULT
+
     else:
-        print(f"--- ❌ Agent: Tried to call an unknown tool: {function_name} ---")
+        activity.logger.error(f"--- ❌ Agent: Tried to call an unknown tool: {function_name} ---")
+        return f"Error: Agent tried to call unknown tool {function_name}"

@@ -1,46 +1,57 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
+from temporalio.client import Client # <-- 1. IMPORT THE TEMPORAL CLIENT
+from src.workflows import IncidentWorkflow # <-- Import your workflow
 
-# Import our refactored investigation logic
-from src.orchestrator import handle_incident
+# --- TEMPORAL CLIENT SETUP ---
+temporal_client = None
 
-# 1. Create the FastAPI "app" instance
 app = FastAPI(
     title="Fireline API",
     description="API for the Fireline SRE Incident Commander"
 )
 
-# 2. Define the *expected* data shape for an alert
-# This is a Pydantic model. It provides automatic data validation.
+@app.on_event("startup")
+async def startup_event():
+    """On API startup, connect to the Temporal server."""
+    global temporal_client
+    temporal_client = await Client.connect("127.0.0.1:7233")
+    print("--- 🚀 API: Connected to Temporal server ---")
+
+
+# (The 'Alert' Pydantic model stays exactly the same)
 class Alert(BaseModel):
     timestamp: str = Field(..., example="2025-10-21T03:05:00Z")
     service: str = Field(..., example="auth-service")
     error_message: str = Field(..., example="High CPU Utilization")
 
-
-# 3. Create a "GET" endpoint for basic health checks
 @app.get("/")
 def read_root():
     """A simple endpoint to check if the API is online."""
     return {"status": "Fireline API is running"}
 
-
-# 4. Create the "POST" endpoint for receiving webhooks
+# 4. UPDATE THE WEBHOOK ENDPOINT
 @app.post("/webhook/alert")
-def post_new_alert(alert: Alert, background_tasks: BackgroundTasks):
+async def post_new_alert(alert: Alert): # <-- 3. Make 'async', remove BackgroundTasks
     """
-    This is the main webhook endpoint.
-    It receives an alert, validates it using the Alert model,
-    and hands off the investigation to a background task.
+    Receives an alert and starts a durable Temporal workflow.
     """
 
     print(f"--- 🚀 API: New alert received for {alert.service} ---")
 
-    # SDE Best Practice: Don't make the user wait!
-    # An HTTP request should return in <1 second.
-    # Our investigation takes 10-20 seconds.
-    # So, we add the *long* task to the background.
-    background_tasks.add_task(handle_incident, alert.model_dump())
+    # 4. THIS IS THE NEW LOGIC
+    # We are "starting" a workflow, which is like sending
+    # that certified letter.
+    await temporal_client.start_workflow(
+        # The name of the workflow class
+        IncidentWorkflow.run, # <-- Use the run method
+        # The arguments to pass to the workflow's run method
+        alert.model_dump(),
+        # A unique ID for this specific investigation
+        id=f"incident-workflow-{alert.service}-{alert.timestamp}",
+        # The "task queue" our Worker is listening on
+        task_queue="fireline-task-queue",
+    )
 
-    # And return an "OK" message *immediately*.
-    return {"status": "investigation_started"}
+    # We still return immediately!
+    return {"status": "investigation_workflow_started"}
