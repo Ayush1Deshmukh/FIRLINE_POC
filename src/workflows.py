@@ -1,10 +1,11 @@
 from temporalio import workflow
 import dataclasses
 from datetime import timedelta
+from temporalio.common import RetryPolicy
 
 # Import the activity function we just defined
 # Note: We import from src.activities, NOT src.orchestrator
-from src.activities import run_investigation
+
 
 # A workflow is defined as a class
 @workflow.defn
@@ -22,11 +23,11 @@ class IncidentWorkflow:
         # Temporal will find a Worker and tell it to run
         # the 'run_investigation' function with our 'alert' object.
         summary = await workflow.execute_activity(
-            run_investigation,
+            "run_investigation",
             alert,
             start_to_close_timeout=timedelta(minutes=5),
             # This ensures the activity is retried if it fails
-            retry_policy=workflow.RetryPolicy(
+            retry_policy=RetryPolicy(  # <--- FIX 2: REMOVED 'workflow.'
                 maximum_attempts=3
             )
         )
