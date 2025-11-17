@@ -3,5 +3,7 @@ python-dotenv
 requests
 fastapi
 uvicorn[standard]
-google-generativeai
 temporalio
+psycopg[binary]
+pgvector
+tiktoken
