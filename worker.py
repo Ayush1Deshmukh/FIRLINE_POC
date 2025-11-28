@@ -4,8 +4,7 @@ from temporalio.worker import Worker
 
 # 1. IMPORT YOUR NEW WORKFLOW AND ACTIVITY
 from src.workflows import IncidentWorkflow
-from src.activities import run_investigation
-
+from src.activities import run_investigation, execute_remediation
 async def main():
     print("--- 👟 Temporal Worker starting... ---")
     # Connect to the local Temporal server
@@ -18,7 +17,7 @@ async def main():
         client,
         task_queue="fireline-task-queue", # <-- This name must match the API
         workflows=[IncidentWorkflow],    # <-- Tell it about your workflow
-        activities=[run_investigation],  # <-- Tell it about your activity
+        activities=[run_investigation, execute_remediation],  # <-- Tell it about your activity
     )
     print("--- ✅ Temporal Worker connected and listening on 'fireline-task-queue' ---")
 

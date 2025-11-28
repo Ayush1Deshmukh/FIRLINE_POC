@@ -1,4 +1,16 @@
+import os
+import psycopg
+import google.generativeai as genai
+from pgvector.psycopg import register_vector
 import datetime
+
+# Configure GenAI (we reuse the key from env)
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+# DB Connection String
+DB_CONNECTION = "dbname=fireline"
 
 def search_logs(timestamp_str, log_file="mock_service.log", time_window_seconds=60):
     """
@@ -39,3 +51,45 @@ def search_logs(timestamp_str, log_file="mock_service.log", time_window_seconds=
 
     print(f"--- 🛠️ Tool: Found {len(found_errors)} error(s). ---")
     return found_errors
+
+def search_runbooks(query_text):
+    """
+    Searches the runbook knowledge base for relevant remediation steps using Vector Search.
+    """
+    print(f"--- 📚 Tool: Searching runbooks for: '{query_text}' ---")
+
+    try:
+        # 1. Turn the query (e.g., "High CPU fix") into a vector using Google
+        model_name = "models/text-embedding-004"
+        result = genai.embed_content(
+            model=model_name,
+            content=query_text,
+            task_type="retrieval_query"
+        )
+        query_vector = result['embedding']
+
+        # 2. Search Postgres for the nearest neighbor
+        with psycopg.connect(DB_CONNECTION, autocommit=True) as conn:
+            register_vector(conn)
+
+            # The <=> operator is "Cosine Distance"
+            # LIMIT 1 means "give me the single best match"
+            result = conn.execute(
+                """
+                SELECT content 
+                FROM runbook_chunks 
+                ORDER BY embedding <=> %s 
+                LIMIT 1
+                """,
+                (query_vector,)
+            ).fetchone()
+
+            if result:
+                print("--- 📚 Tool: Found relevant runbook entry! ---")
+                return result[0] # Return the text content
+            else:
+                return "No relevant runbooks found."
+
+    except Exception as e:
+        print(f"--- ❌ Tool Error: {e} ---")
+        return f"Error searching runbooks: {e}"

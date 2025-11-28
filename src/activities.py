@@ -3,10 +3,10 @@ import json
 import google.generativeai as genai
 from dotenv import load_dotenv
 from temporalio import activity
-# No 'FunctionResponse' import needed, we will use genai.types
+import asyncio
 
 # Import our local tools
-from src.tools import search_logs
+from src.tools import search_logs, search_runbooks
 from src.notifications import post_to_slack
 
 # --- 1. SETUP ---
@@ -21,122 +21,137 @@ try:
 except Exception as e:
     activity.logger.error(f"Error initializing Google GenAI client: {e}")
 
-# --- 2. DEFINE THE "TOOLS" FOR THE LLM ---
+# --- 2. DEFINE THE TOOLS ---
 search_logs_tool = {
     "name": "search_logs",
     "description": "Searches a log file for ERROR lines within a time window around a specific timestamp.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "timestamp_str": {
-                "type": "STRING",
-                "description": "The ISO 8601 timestamp string (e.g., '2025-10-21T03:05:00Z')."
-            },
-            "log_file": {
-                "type": "STRING",
-                "description": "The path to the log file to search. (Default: mock_service.log)"
-            },
-            "time_window_seconds": {
-                "type": "INTEGER",
-                "description": "The total number of seconds for the search window (e.g., 60 means 30s before and 30s after the timestamp)."
-            }
+            "timestamp_str": { "type": "STRING", "description": "The ISO 8601 timestamp string." },
+            # We hide the log_file parameter so the AI stops guessing it
+            "time_window_seconds": { "type": "INTEGER", "description": "The total number of seconds for the search window." }
         },
-        # --- FIX: 'log_file' is now OPTIONAL ---
         "required": ["timestamp_str"] 
     }
 }
 
-# --- 3. DEFINE THE AGENT'S "PERSONALITY" AND TASK ---
-SYSTEM_PROMPT = """
-You are "Fireline-01", an autonomous SRE incident investigation agent.
-Your sole purpose is to investigate alerts by using the tools provided.
-You will be given an alert as a JSON object.
+search_runbooks_tool = {
+    "name": "search_runbooks",
+    "description": "Searches the runbook database for known fixes and remediation steps.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "query_text": { "type": "STRING", "description": "The error message or symptom to search for (e.g. 'High CPU', 'NullPointerException')." }
+        },
+        "required": ["query_text"]
+    }
+}
 
-Follow these steps:
-1. Analyze the alert.
-2. Select the *best* tool to investigate the alert (e.g., `search_logs`).
-3. Call the tool with the *exact* parameters derived from the alert. 
-   If you are not given a specific log file path, do not invent one.
-4. Once you receive the tool's output (e.g., log lines), analyze them.
-5. Provide a concise, final summary of your findings and a root cause hypothesis.
-6. Do NOT make up information. Base your summary *only* on the tool's output.
+# --- 3. DEFINE THE AGENT'S TASK ---
+SYSTEM_PROMPT = """
+You are "Fireline-01", an expert SRE Incident Commander.
+Your goal is to:
+1. IDENTIFY the root cause using logs.
+2. FIND the remediation using the runbook.
+3. REPORT the specific commands to fix it.
+
+Process:
+- Start by searching logs around the alert time.
+- Analyze the log errors.
+- IF you find a specific error, call the `search_runbooks` tool to find a fix.
+- Once you have the fix, provide a final summary.
 """
 
 # --- 4. CREATE THE MODEL ---
-# We use 'models/gemini-pro-latest' which was on your approved list
 model = genai.GenerativeModel(
     model_name='models/gemini-pro-latest',
     system_instruction=SYSTEM_PROMPT,
-    tools=[search_logs_tool]
+    tools=[search_logs_tool, search_runbooks_tool]
 )
 
 
-# --- 5. THE ACTIVITY DEFINITION ---
+# --- 5. THE ACTIVITY DEFINITIONS ---
+
+@activity.defn
+async def execute_remediation(command: str) -> str:
+    """
+    Executes the remediation command.
+    """
+    activity.logger.info(f"--- ⚠️ EXECUTING REMEDIATION: {command} ---")
+
+    # Simulate a delay
+    await asyncio.sleep(2)
+
+    result = f"Successfully executed: {command}. Service health checks passing."
+    activity.logger.info(f"--- ✅ Execution Complete: {result} ---")
+
+    return result
+
 @activity.defn
 async def run_investigation(alert: dict) -> str:
     activity.logger.info(f"--- 🔥 Fireline Investigation Started for {alert['service']} ---")
 
     chat = model.start_chat()
-
-    activity.logger.info("--- 🧠 Agent: Analyzing alert and selecting tool... ---")
-
     user_prompt = f"New Incident Alert: {json.dumps(alert)}"
 
-    try:
-        response = await chat.send_message_async(user_prompt)
+    # --- THE AGENT LOOP (Max 5 Turns) ---
+    for turn in range(5):
+        activity.logger.info(f"--- 🔄 Turn {turn + 1}: Asking LLM... ---")
 
-        response_message = response.candidates[0].content
+        try:
+            # Send message (user prompt on first turn, empty on subsequent turns)
+            response = await chat.send_message_async(user_prompt if turn == 0 else [])
+            response_message = response.candidates[0].content
 
-        if not response_message.parts[0].function_call:
-            activity.logger.warn("--- 🧠 Agent: Did not select a tool. ---")
-            final_summary = response_message.parts[0].text
-            if final_summary:
-                post_to_slack(final_summary)
-            return final_summary
+            # CHECK: Does the AI want to use a tool?
+            if not response_message.parts[0].function_call:
+                activity.logger.info("--- 🧠 Agent decided to stop. Finalizing... ---")
+                final_summary = response_message.parts[0].text
 
-        function_call = response_message.parts[0].function_call
-        function_name = function_call.name
+                if final_summary:
+                    post_to_slack(final_summary)
+                return final_summary
 
-        if function_name == "search_logs":
-            activity.logger.info(f"--- 🧠 Agent: Decided to call `{function_name}` tool. ---")
-
+            # EXECUTE: The AI wants to use a tool
+            function_call = response_message.parts[0].function_call
+            function_name = function_call.name
             function_args = function_call.args
 
-            # The LLM should no longer invent a path, so this will use the default.
-            tool_output = search_logs(
-                timestamp_str=function_args.get("timestamp_str"),
-                log_file=function_args.get("log_file", "mock_service.log"),
-                time_window_seconds=function_args.get("time_window_seconds", 60)
-            )
+            activity.logger.info(f"--- 🛠️ Calling Tool: {function_name} ---")
+            tool_result_json = "{}"
 
-            tool_output_json = json.dumps(tool_output)
+            if function_name == "search_logs":
+                # FIX 1: We FORCE the mock file. We do not trust the AI to guess the path.
+                tool_output = search_logs(
+                    timestamp_str=function_args.get("timestamp_str"),
+                    log_file="mock_service.log", 
+                    time_window_seconds=function_args.get("time_window_seconds", 60)
+                )
+                tool_result_json = json.dumps(tool_output)
 
-            activity.logger.info("--- 🧠 Agent: Sending tool output back to LLM... ---")
+            elif function_name == "search_runbooks":
+                query_text = function_args.get("query_text")
+                tool_output = search_runbooks(query_text)
+                tool_result_json = json.dumps(tool_output)
 
-            # --- FIX: Use 'genai.types.FunctionResponse' directly ---
-            final_response = await chat.send_message_async(
-                [
-                    genai.types.FunctionResponse(
-                        name="search_logs",
-                        response={"result": tool_output_json}
-                    )
-                ]
-            )
+            else:
+                activity.logger.error(f"Unknown tool: {function_name}")
+                tool_result_json = json.dumps({"error": "Unknown tool"})
 
-            final_summary = final_response.candidates[0].content.parts[0].text
-            activity.logger.info("--- ✅ Investigation Complete. Final Summary: ---")
-            activity.logger.info(final_summary)
+            # RESPOND: Send tool output back to the AI
+            # FIX 2: We use a raw DICTIONARY to avoid import errors
+            response_part = {
+                "function_response": {
+                    "name": function_name,
+                    "response": {"result": tool_result_json}
+                }
+            }
 
-            if final_summary:
-                post_to_slack(final_summary)
+            await chat.send_message_async(response_part)
 
-            return final_summary
+        except Exception as e:
+            activity.logger.error(f"--- ❌ FATAL ERROR in investigation: {e} ---")
+            raise e
 
-        else:
-            activity.logger.error(f"--- ❌ Agent: Tried to call unknown tool: {function_name} ---")
-            return f"Error: Agent tried to call unknown tool {function_name}"
-
-    except Exception as e:
-        activity.logger.error(f"--- ❌ FATAL ERROR in investigation: {e} ---")
-        # This ensures Temporal knows the activity failed
-        raise e
+    return "Agent reached max turns without resolution."
