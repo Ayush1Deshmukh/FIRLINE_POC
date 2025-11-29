@@ -16,7 +16,14 @@ app = FastAPI(
     title="Fireline API",
     description="API for the Fireline SRE Incident Commander"
 )
+from fastapi.middleware.cors import CORSMiddleware
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows Streamlit Cloud to connect
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 @app.on_event("startup")
 async def startup_event():
     """On API startup, connect to the Temporal server."""

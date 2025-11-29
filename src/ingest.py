@@ -17,7 +17,7 @@ genai.configure(api_key=GOOGLE_API_KEY)
 # 2. Connect to the Database
 try:
     print("--- 📚 Librarian: Connecting to 'fireline' database... ---")
-    conn = psycopg.connect("dbname=fireline", autocommit=True)
+    conn = psycopg.connect(os.environ.get("DB_CONNECTION"), autocommit=True)
 except Exception as e:
     print(f"❌ Error connecting to DB: {e}")
     print("Did you run 'createdb fireline'?")

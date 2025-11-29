@@ -10,7 +10,7 @@ if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
 # DB Connection String
-DB_CONNECTION = "dbname=fireline"
+DB_CONNECTION = os.environ.get("DB_CONNECTION")
 
 def search_logs(timestamp_str, log_file="mock_service.log", time_window_seconds=60):
     """
