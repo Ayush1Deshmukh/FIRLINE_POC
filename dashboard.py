@@ -4,7 +4,7 @@ import json
 import time
 
 # Configuration
-API_URL = "http://127.0.0.1:8000"
+API_URL = "https://fireline-backend.onrender.com"
 
 st.set_page_config(page_title="Fireline Commander", page_icon="🔥", layout="wide")
 
